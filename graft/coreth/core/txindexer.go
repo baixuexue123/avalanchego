@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/ava-labs/libevm/core/rawdb"
+	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/log"
 )
@@ -117,14 +118,24 @@ func (indexer *txIndexer) loop(chain *BlockChain) {
 		lastHead    uint64        // The latest announced chain head (whose tx indexes are assumed created)
 		runningHead uint64        // The head number being processed in background.
 
-		headCh = make(chan ChainEvent)
-		sub    = chain.SubscribeChainAcceptedEvent(headCh)
+		// Subscribe to both chain events (for unfinalized blocks) and accepted events (for cleanup)
+		chainEventCh  = make(chan ChainEvent)
+		chainEventSub = chain.SubscribeChainEvent(chainEventCh)
+
+		acceptedCh  = make(chan ChainEvent)
+		acceptedSub = chain.SubscribeChainAcceptedEvent(acceptedCh)
 	)
-	if sub == nil {
-		log.Warn("could not create chain accepted subscription to unindex txs")
+	if chainEventSub == nil {
+		log.Warn("could not create chain event subscription to index txs")
 		return
 	}
-	defer sub.Unsubscribe()
+	if acceptedSub == nil {
+		log.Warn("could not create chain accepted subscription to unindex txs")
+		chainEventSub.Unsubscribe()
+		return
+	}
+	defer chainEventSub.Unsubscribe()
+	defer acceptedSub.Unsubscribe()
 
 	// startRun launches the background unindexing task.
 	startRun := func(newHead uint64) {
@@ -135,7 +146,7 @@ func (indexer *txIndexer) loop(chain *BlockChain) {
 		go indexer.lockedRun(runningHead, stop, done)
 	}
 
-	log.Info("Initialized transaction unindexer", "limit", indexer.limit)
+	log.Info("Initialized transaction indexer and unindexer", "limit", indexer.limit)
 
 	// Launch the initial processing if chain is not empty (head != genesis).
 	// This step is useful in these scenarios that chain has no progress.
@@ -144,7 +155,13 @@ func (indexer *txIndexer) loop(chain *BlockChain) {
 	}
 	for {
 		select {
-		case head := <-headCh:
+		case head := <-chainEventCh:
+			// Index transactions from new blocks (including unfinalized ones)
+			// This allows querying transactions before they are accepted
+			indexer.indexBlock(head.Block)
+
+		case head := <-acceptedCh:
+			// Unindex old transactions when blocks are accepted
 			headNum := head.Block.NumberU64()
 			if headNum < indexer.limit {
 				break
@@ -195,4 +212,13 @@ func (indexer *txIndexer) lockedRun(head uint64, stop chan struct{}, done chan s
 	indexer.run(rawdb.ReadTxIndexTail(indexer.db), head, stop, done)
 	indexer.chain.txIndexTailLock.Unlock()
 	indexer.chain.wg.Done()
+}
+
+// indexBlock indexes all transactions in the given block
+func (indexer *txIndexer) indexBlock(block *types.Block) {
+	batch := indexer.db.NewBatch()
+	rawdb.WriteTxLookupEntriesByBlock(batch, block)
+	if err := batch.Write(); err != nil {
+		log.Warn("Failed to index block transactions", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
+	}
 }
