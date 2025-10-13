@@ -98,6 +98,7 @@ type OracleBackend interface {
 	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
 	SubscribeChainAcceptedEvent(ch chan<- core.ChainEvent) event.Subscription
 	LastAcceptedBlock() *types.Block
+	IsAllowUnfinalizedQueries() bool
 }
 
 // Oracle recommends gas prices based on the content of recent
